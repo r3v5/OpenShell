@@ -1693,6 +1693,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1804,6 +1805,38 @@ pub async fn sandbox_create(
     // is expected to persist beyond the initial session.
     if persist && let Some(gateway) = effective_tls.gateway_name() {
         let _ = save_last_sandbox(gateway, &sandbox_name);
+    }
+
+    // Persist `--approval-mode` as a sandbox-scoped setting now that the
+    // sandbox exists. `manual` is the implicit default (no setting needed);
+    // any other value is written so it survives sandbox restarts and can be
+    // flipped later via `openshell settings set <name> proposal_approval_mode`.
+    // If the write fails the sandbox still runs in default `manual` — surface
+    // the recovery command so the user can retry.
+    if approval_mode != "manual" {
+        let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
+        match client
+            .update_config(UpdateConfigRequest {
+                name: sandbox_name.clone(),
+                policy: None,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(setting),
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: 0,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(status) => {
+                eprintln!(
+                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
+                    "warning:".yellow().bold(),
+                    status.message(),
+                );
+            }
+        }
     }
 
     // Set up display — interactive terminals get a step-based checklist with
@@ -5519,7 +5552,23 @@ fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
     })?;
 
     let value = match setting.kind {
-        SettingValueKind::String => setting_value::Value::StringValue(raw_value.to_string()),
+        SettingValueKind::String => {
+            // Reject typos client-side so `openshell settings set ...
+            // proposal_approval_mode autom` errors immediately instead of
+            // round-tripping through the server. The server enforces the
+            // same check independently for non-CLI callers.
+            setting
+                .validate_string_value(raw_value)
+                .map_err(|allowed| {
+                    miette::miette!(
+                        "invalid value '{}' for key '{}'; expected one of: {}",
+                        raw_value,
+                        key,
+                        allowed.join(", ")
+                    )
+                })?;
+            setting_value::Value::StringValue(raw_value.to_string())
+        }
         SettingValueKind::Int => {
             let parsed = raw_value.trim().parse::<i64>().map_err(|_| {
                 miette::miette!(
@@ -6737,6 +6786,13 @@ pub async fn sandbox_draft_get(
                 "  {} {}",
                 "Security:".dimmed(),
                 chunk.security_notes.yellow()
+            );
+        }
+        if !chunk.validation_result.is_empty() {
+            println!(
+                "  {} {}",
+                "Validation:".dimmed(),
+                chunk.validation_result.cyan()
             );
         }
 
