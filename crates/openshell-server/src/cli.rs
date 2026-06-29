@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
-use crate::compute::{DockerComputeConfig, VmComputeConfig};
+use crate::compute::VmComputeConfig;
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::defaults::{self, LocalTlsPaths};
 use crate::{run_server, tracing_bus::TracingLogBus};
@@ -428,8 +428,6 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         args.disable_tls,
         args.port,
     )?;
-    let docker_config = build_docker_config(file.as_ref(), local_tls.as_ref())?;
-
     if args.disable_tls {
         warn!("TLS disabled — listening on plaintext HTTP");
     } else {
@@ -464,15 +462,9 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
-    Box::pin(run_server(
-        config,
-        vm_config,
-        docker_config,
-        file,
-        tracing_log_bus,
-    ))
-    .await
-    .into_diagnostic()
+    Box::pin(run_server(config, vm_config, file, tracing_log_bus))
+        .await
+        .into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
@@ -779,33 +771,6 @@ fn build_vm_config(
         let scheme = if disable_tls { "http" } else { "https" };
         cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{gateway_port}");
     }
-    apply_guest_tls_defaults(
-        &mut cfg.guest_tls_ca,
-        &mut cfg.guest_tls_cert,
-        &mut cfg.guest_tls_key,
-        local_tls,
-    );
-    Ok(cfg)
-}
-
-/// Build [`DockerComputeConfig`] using the same inheritance pattern as
-/// [`build_vm_config`].
-fn build_docker_config(
-    file: Option<&ConfigFile>,
-    local_tls: Option<&LocalTlsPaths>,
-) -> Result<DockerComputeConfig> {
-    let mut cfg = if let Some(file) = file {
-        let merged = config_file::driver_table(
-            ComputeDriverKind::Docker,
-            &file.openshell.gateway,
-            file.openshell.drivers.get("docker"),
-        );
-        merged
-            .try_into::<DockerComputeConfig>()
-            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"))?
-    } else {
-        DockerComputeConfig::default()
-    };
     apply_guest_tls_defaults(
         &mut cfg.guest_tls_ca,
         &mut cfg.guest_tls_cert,
@@ -1838,19 +1803,5 @@ default_image = "k8s-specific:1.0"
             .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
             .expect("deserializes");
         assert_eq!(parsed.default_image, "k8s-specific:1.0");
-    }
-
-    #[test]
-    fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
-        let file = config_file_from_toml(
-            r"
-[openshell.drivers.docker]
-enable_bind_mounts = true
-",
-        );
-
-        let cfg = super::build_docker_config(Some(&file), None).expect("docker config");
-
-        assert!(cfg.enable_bind_mounts);
     }
 }

@@ -208,7 +208,6 @@ impl ServerState {
 pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
-    docker_config: DockerComputeConfig,
     config_file: Option<config_file::ConfigFile>,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
@@ -243,7 +242,6 @@ pub async fn run_server(
     let compute = build_compute_runtime(
         &config,
         &vm_config,
-        &docker_config,
         config_file.as_ref(),
         store.clone(),
         sandbox_index.clone(),
@@ -720,7 +718,6 @@ async fn terminate_signal() {
 async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
-    docker_config: &DockerComputeConfig,
     file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
@@ -751,17 +748,21 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => ComputeRuntime::new_docker(
-            config.clone(),
-            docker_config.clone(),
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
+            let mut docker = docker_config_from_file(file)?;
+            apply_docker_local_tls_defaults(config, &mut docker)?;
+            ComputeRuntime::new_docker(
+                config.clone(),
+                docker,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
@@ -894,6 +895,44 @@ fn apply_podman_local_tls_defaults(
     podman.guest_tls_ca = Some(paths.ca);
     podman.guest_tls_cert = Some(paths.client_cert);
     podman.guest_tls_key = Some(paths.client_key);
+    Ok(())
+}
+
+/// Same pattern as [`kubernetes_config_from_file`] but for Docker.
+fn docker_config_from_file(file: Option<&config_file::ConfigFile>) -> Result<DockerComputeConfig> {
+    let Some(file) = file else {
+        return Ok(DockerComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::Docker,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("docker"),
+    );
+    merged
+        .try_into()
+        .map_err(|e| Error::config(format!("invalid [openshell.drivers.docker] table: {e}")))
+}
+
+fn apply_docker_local_tls_defaults(
+    config: &Config,
+    docker: &mut DockerComputeConfig,
+) -> Result<()> {
+    if config.tls.is_none()
+        || docker.guest_tls_ca.is_some()
+        || docker.guest_tls_cert.is_some()
+        || docker.guest_tls_key.is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(paths) = defaults::complete_local_tls_paths()
+        .map_err(|e| Error::config(format!("failed to resolve local TLS defaults: {e}")))?
+    else {
+        return Ok(());
+    };
+    docker.guest_tls_ca = Some(paths.ca);
+    docker.guest_tls_cert = Some(paths.client_cert);
+    docker.guest_tls_key = Some(paths.client_key);
     Ok(())
 }
 
@@ -1545,6 +1584,21 @@ enable_bind_mounts = true
         .expect("valid config");
 
         let cfg = crate::podman_config_from_file(Some(&file)).expect("podman config");
+
+        assert!(cfg.enable_bind_mounts);
+    }
+
+    #[test]
+    fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
+        let file: crate::config_file::ConfigFile = toml::from_str(
+            r"
+[openshell.drivers.docker]
+enable_bind_mounts = true
+",
+        )
+        .expect("valid config");
+
+        let cfg = crate::docker_config_from_file(Some(&file)).expect("docker config");
 
         assert!(cfg.enable_bind_mounts);
     }
